@@ -1,0 +1,12 @@
+﻿{
+  "defaultWorkspace": "D:\\project",
+  "modelListUrl": "http://127.0.0.1:3425/v1/models",
+  "telegramApiBaseUrl": "https://api.telegram.org",
+  "maxImageBytes": 20971520,
+  "pollTimeoutSeconds": 25,
+  "allowedCwdRoots": [
+    "D:\\project",
+    "D:\\",
+    "C:\\Users"
+  ]
+}
