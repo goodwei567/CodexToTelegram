@@ -44,6 +44,12 @@ The Bridge binds to the first Telegram user that successfully pairs. It ignores 
 - `/permission` — select read-only, project-write, or fully unrestricted access.
 - `/status` — show the current thread, model, workspace, and permission.
 - `/stop` — interrupt the active Codex turn.
+- `/cwd [path]` — view or change the working directory.
+- `/rename name` — rename the current session.
+- `/archive` — archive the current session.
+- `/fork [topic]` — fork the session to a new topic.
+- `/compact` — compact session history to reduce token usage.
+- `/effort` — set reasoning effort level (low/medium/high/ultra).
 - Send text or an image to start a Codex turn.
 
 The default workspace and model-list endpoint are in `bridge.config.json`. The bot checks the proxy model list again before applying a model. Image downloads are limited to 20 MB and stored under `.runtime/attachments`.
