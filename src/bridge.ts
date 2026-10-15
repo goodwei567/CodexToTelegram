@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { BridgeConfig } from "./config.js";
 import { CodexRpc } from "./codex-rpc.js";
@@ -16,6 +16,7 @@ import type {
   PermissionMode,
   RpcMessage,
   TelegramCallbackQuery,
+  TelegramFile,
   TelegramMessage,
   TelegramPhotoSize,
   TelegramUpdate,
@@ -90,15 +91,35 @@ interface InputFlow {
   index: number;
 }
 
-interface TelegramFile {
-  file_id: string;
-  file_size?: number;
-  file_path?: string;
-}
-
 interface ProxyModel {
   id: string;
   name?: string;
+}
+
+interface ExtractedAttachment {
+  fileId: string;
+  fileName: string;
+  fileSize?: number;
+  mimeType?: string;
+  isImage: boolean;
+}
+
+const BITMAP_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]);
+
+function isBitmapImage(fileName: string, mimeType?: string): boolean {
+  if (mimeType) {
+    const lower = mimeType.toLowerCase();
+    if (lower.startsWith("image/") && !lower.includes("svg")) return true;
+  }
+  const ext = path.extname(fileName).toLowerCase();
+  return BITMAP_IMAGE_EXTS.has(ext);
+}
+
+function formatFileSize(bytes?: number): string {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 const PAGE_SIZE = 8;
@@ -338,23 +359,60 @@ export class Bridge {
 
     
 
-    const image = this.extractImage(message);
-    if (!text.trim() && !image) return;
+    const attachment = this.extractAttachment(message);
+    if (!text.trim() && !attachment) return;
     const conversation = await this.ensureConversation(context);
-    let imagePath: string | undefined;
-    if (image) {
+    let filePath: string | undefined;
+    if (attachment) {
       try {
-        imagePath = await this.downloadImage(image.fileId, image.fileSize);
+        filePath = await this.downloadAttachment(attachment);
       } catch (error) {
-        await this.send(context, `图片无法接收：${this.errorText(error)}`);
+        await this.send(context, `文件接收失败：${this.errorText(error)}`);
         return;
       }
     }
-    const prompt = text.trim() || "请查看这张图片并说明内容。";
-    const input: Array<Record<string, unknown>> = [
-      { type: "text", text: prompt, text_elements: [] },
-    ];
-    if (imagePath) input.push({ type: "localImage", path: imagePath });
+
+    const input: Array<Record<string, unknown>> = [];
+    if (attachment?.isImage && filePath) {
+      input.push({ type: "localImage", path: filePath });
+      const prompt = text.trim() || "请查看这张图片并说明内容。";
+      input.unshift({ type: "text", text: prompt, text_elements: [] });
+    } else if (attachment && filePath) {
+      const sizeStr = formatFileSize(attachment.fileSize);
+      const userPrompt = text.trim();
+      let fileSnippet = "";
+
+      const ext = path.extname(attachment.fileName).toLowerCase();
+      const TEXT_EXTS = new Set([
+        ".txt", ".md", ".json", ".csv", ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".html", ".css", ".c", ".cpp", ".h", ".hpp", ".rs", ".go", ".java",
+        ".sh", ".bat", ".ps1", ".sql", ".xml", ".yaml", ".yml", ".ini", ".toml", ".log"
+      ]);
+      if (TEXT_EXTS.has(ext) && (attachment.fileSize ?? 0) <= 65536) {
+        try {
+          const content = await readFile(filePath, "utf8");
+          if (content.length <= 65536) {
+            const lang = ext.replace(/^\./, "");
+            fileSnippet = `\n\n文件内容如下：\n\`\`\`${lang}\n${content}\n\`\`\``;
+          }
+        } catch {
+          // Binary or encoding error, skip inline snippet
+        }
+      }
+
+      const promptLines = [
+        `用户上传了文件：${attachment.fileName}${sizeStr ? ` (${sizeStr})` : ""}`,
+        `本地已保存至：${filePath}`,
+        userPrompt ? `用户要求：${userPrompt}` : "请查看并分析该文件内容，向用户说明或提供帮助。",
+      ];
+      if (fileSnippet) {
+        promptLines.push(fileSnippet);
+      }
+      input.push({ type: "text", text: promptLines.join("\n"), text_elements: [] });
+    } else {
+      input.push({ type: "text", text: text.trim(), text_elements: [] });
+    }
+
     await this.startOrSteerTurn(conversationKey, context, conversation, input);
   }
 
@@ -485,7 +543,7 @@ export class Bridge {
         "/compact — 压缩会话历史",
         "/effort — 设置推理强度(low/medium/high/ultra)",
         "",
-        "直接发送文字或图片即可交给 Codex。",
+        "直接发送文字、图片或文件（PDF、代码、文档等）即可交给 Codex。",
       ].join("\n"),
     );
   }
@@ -1421,73 +1479,101 @@ export class Bridge {
     };
   }
 
-  private async downloadImage(fileId: string, expectedSize?: number): Promise<string> {
-    if (expectedSize && expectedSize > this.config.maxImageBytes) {
-      throw new Error("图片超过 20 MB。请压缩后再发。");
-    }
-    const file = await this.telegram.call<TelegramFile>("getFile", {
-      file_id: fileId,
-    });
-    if (!file.file_path) throw new Error("Telegram 没有返回图片文件路径。");
-    if (file.file_size && file.file_size > this.config.maxImageBytes) {
-      throw new Error("图片超过 20 MB。请压缩后再发。");
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(
-        `${this.config.telegramApiBaseUrl}/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`,
-        { signal: AbortSignal.timeout(30_000) },
-      );
-    } catch {
-      throw new Error("下载图片失败。");
-    }
-    if (!response.ok || !response.body) throw new Error("下载图片失败。");
-    const contentLength = Number(response.headers.get("content-length") ?? 0);
-    if (contentLength > this.config.maxImageBytes) {
-      await response.body.cancel();
-      throw new Error("图片超过 20 MB。请压缩后再发。");
-    }
-
-    const reader = response.body.getReader();
-    const chunks: Buffer[] = [];
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > this.config.maxImageBytes) {
-        await reader.cancel();
-        throw new Error("图片超过 20 MB。请压缩后再发。");
-      }
-      chunks.push(Buffer.from(value));
-    }
-    if (total === 0) throw new Error("Telegram 返回了空图片。");
-
-    const extension = path.extname(file.file_path).replace(/[^.a-zA-Z0-9]/g, "") || ".img";
-    const target = path.join(this.attachmentsDir, `${randomUUID()}${extension}`);
-    await writeFile(target, Buffer.concat(chunks), { mode: 0o600 });
-    return target;
-  }
-
-  private extractImage(
-    message: TelegramMessage,
-  ): { fileId: string; fileSize?: number } | null {
-    const photo = message.photo?.at(-1) as TelegramPhotoSize | undefined;
+  private extractAttachment(message: TelegramMessage): ExtractedAttachment | null {
+    const photo = message.photo?.at(-1);
     if (photo) {
       return {
         fileId: photo.file_id,
-        ...(photo.file_size ? { fileSize: photo.file_size } : {}),
+        fileName: "photo.jpg",
+        fileSize: photo.file_size,
+        mimeType: "image/jpeg",
+        isImage: true,
       };
     }
-    const document = message.document;
-    if (document?.mime_type?.toLowerCase().startsWith("image/")) {
+    const doc = message.document;
+    if (doc) {
+      const rawName = doc.file_name?.trim() || "";
+      const isImage = isBitmapImage(rawName, doc.mime_type);
       return {
-        fileId: document.file_id,
-        ...(document.file_size ? { fileSize: document.file_size } : {}),
+        fileId: doc.file_id,
+        fileName: rawName || (isImage ? "image.png" : "file.bin"),
+        fileSize: doc.file_size,
+        mimeType: doc.mime_type,
+        isImage,
+      };
+    }
+    const audio = message.audio;
+    if (audio) {
+      return {
+        fileId: audio.file_id,
+        fileName: audio.file_name?.trim() || "audio.mp3",
+        fileSize: audio.file_size,
+        mimeType: audio.mime_type,
+        isImage: false,
+      };
+    }
+    const voice = message.voice;
+    if (voice) {
+      return {
+        fileId: voice.file_id,
+        fileName: "voice.ogg",
+        fileSize: voice.file_size,
+        mimeType: voice.mime_type ?? "audio/ogg",
+        isImage: false,
+      };
+    }
+    const video = message.video;
+    if (video) {
+      return {
+        fileId: video.file_id,
+        fileName: video.file_name?.trim() || "video.mp4",
+        fileSize: video.file_size,
+        mimeType: video.mime_type,
+        isImage: false,
+      };
+    }
+    const videoNote = message.video_note;
+    if (videoNote) {
+      return {
+        fileId: videoNote.file_id,
+        fileName: "video_note.mp4",
+        fileSize: videoNote.file_size,
+        mimeType: "video/mp4",
+        isImage: false,
       };
     }
     return null;
+  }
+
+  private async downloadAttachment(attachment: ExtractedAttachment): Promise<string> {
+    const maxBytes = this.config.maxImageBytes;
+    if (attachment.fileSize && attachment.fileSize > maxBytes) {
+      throw new Error(`文件大小（${formatFileSize(attachment.fileSize)}）超过 Telegram Bot 限制（最大 20 MB）。`);
+    }
+
+    const file = await this.telegram.getFile(attachment.fileId);
+    if (!file.file_path) {
+      throw new Error("Telegram 没有返回文件下载路径。");
+    }
+    if (file.file_size && file.file_size > maxBytes) {
+      throw new Error(`文件大小超过限制（最大 ${(maxBytes / (1024 * 1024)).toFixed(0)} MB）。`);
+    }
+
+    const buffer = await this.telegram.downloadFile(file.file_path, maxBytes);
+
+    let safeName = path.basename(attachment.fileName).replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+    if (!safeName) safeName = "attachment";
+    let ext = path.extname(safeName);
+    if (!ext && file.file_path) {
+      ext = path.extname(file.file_path);
+      if (ext) safeName += ext;
+    }
+
+    const uploadDir = path.join(this.attachmentsDir, randomUUID());
+    await mkdir(uploadDir, { recursive: true });
+    const target = path.join(uploadDir, safeName);
+    await writeFile(target, buffer, { mode: 0o600 });
+    return target;
   }
 
   private addAction(action: BotAction): string {

@@ -1,6 +1,7 @@
 import type {
   InlineKeyboardMarkup,
   TelegramApiResult,
+  TelegramFile,
   TelegramMessage,
   TelegramUpdate,
 } from "./types.js";
@@ -149,5 +150,42 @@ export class TelegramApi {
       callback_query_id: callbackQueryId,
       ...(text ? { text } : {}),
     });
+  }
+
+  getFile(fileId: string): Promise<TelegramFile> {
+    return this.call<TelegramFile>("getFile", { file_id: fileId });
+  }
+
+  async downloadFile(filePath: string, maxBytes: number, timeoutMs = 60_000): Promise<Buffer> {
+    const url = `${this.apiBaseUrl}/file/bot${this.token}/${filePath}`;
+    let response: Response;
+    try {
+      response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      throw this.networkError("downloadFile", error);
+    }
+    if (!response.ok || !response.body) {
+      throw new Error(`Telegram 文件下载失败 (${response.status} ${response.statusText})。`);
+    }
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+    if (contentLength > maxBytes) {
+      await response.body.cancel();
+      throw new Error(`文件大小超过限制（最大 ${(maxBytes / (1024 * 1024)).toFixed(0)} MB）。`);
+    }
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`文件大小超过限制（最大 ${(maxBytes / (1024 * 1024)).toFixed(0)} MB）。`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    if (total === 0) throw new Error("下载的文件内容为空。");
+    return Buffer.concat(chunks);
   }
 }
